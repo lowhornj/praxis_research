@@ -3,14 +3,19 @@ from pyro.distributions import Normal, Categorical, Independent, OneHotCategoric
 from pgmpy.models import BayesianNetwork
 from pgmpy.estimators import MaximumLikelihoodEstimator
 from matplotlib import pyplot as plt
-from pgmpy.estimators import HillClimbSearch, BicScore
+from pgmpy.estimators import HillClimbSearch, BicScore, PC
 from pgmpy.inference.CausalInference import CausalInference
 from IPython.display import Image
 import torch
 import pandas as pd
+from pgmpy.models import BayesianNetwork
+from pgmpy.estimators import MaximumLikelihoodEstimator, ExpectationMaximization, BayesianEstimator
+import os
+os.environ['NUMEXPR_MAX_THREADS'] = '50'
+os.environ['NUMEXPR_NUM_THREADS'] = '50'
 
 class bayesian_network_inference:
-    def __init__(self,anomaly,vae_model,model_dataframe,input_numpy_data, scoring_method = 'bdeuscore'):
+    def __init__(self,anomaly,vae_model,model_dataframe,input_numpy_data, scoring_method = 'bdsscore'):
         self.anomaly = anomaly
         self.vae_model = vae_model
         self.mod_df = model_dataframe
@@ -36,10 +41,44 @@ class bayesian_network_inference:
 
     def _train_bayes(self):
         # Train Bayesian Network
+        try:
+            pc = PC(self.latent_df)
+            skeleton = pc.estimate(return_type='skeleton',return_separating_sets=True)
+            
+            dag = BayesianNetwork()
+            dag.add_nodes_from(skeleton[0].nodes())
+            
+            for u, v in skeleton[0].edges():
+                dag.add_edge(u,v)
+            
+            import networkx as nx
+            if not nx.is_directed_acyclic_graph(dag):
+                raise ValueError('Dag is still bad')
+            
+            hc = HillClimbSearch(self.latent_df,use_cache =True#, BicScore(latent_df)
+                                )
+            best_model = hc.estimate(start_dag=dag,max_iter = 200,scoring_method =self.scoring_method)
+            self.bayesian_model = BayesianNetwork(best_model.edges())
+            self.bayesian_model.fit(self.latent_df, estimator=MaximumLikelihoodEstimator,n_jobs =5)
+        except MemoryError:
+
+            pc = PC(self.latent_df)
+            skeleton = pc.estimate(return_separating_sets=True)
+            
+            self.bayesian_model = BayesianNetwork()
+            self.bayesian_model.add_nodes_from(skeleton[0].nodes())
+            
+            for u, v in skeleton[0].edges():
+                self.bayesian_model.add_edge(u,v)
+            self.bayesian_model.fit(self.latent_df, estimator=MaximumLikelihoodEstimator,n_jobs =5)
+            
+            
+
+        """
         hc = HillClimbSearch(self.latent_df)
         best_model = hc.estimate(scoring_method=self.scoring_method)
         self.bayesian_model = BayesianNetwork(best_model.edges())
-        self.bayesian_model.fit(self.latent_df, estimator=MaximumLikelihoodEstimator)
+        self.bayesian_model.fit(self.latent_df, estimator=MaximumLikelihoodEstimator)"""
 
     def draw_graph(self,name):
         viz = bayesian_model.to_graphviz()
@@ -75,7 +114,3 @@ class bayesian_network_inference:
         for index in rca_indices:
             self.potential_causes.append( (test_columns[index]))
         self.potential_causes.sort(key=lambda tup: tup[1],reverse=True)
-
-
- 
-        
