@@ -6,8 +6,32 @@ from torch_geometric.data import Data
 import torch_geometric.transforms as T
 import torch.nn.functional as F
 from torch.distributions.normal import Normal
-from tkgngc.utils import vae_loss
+from tkgngc.utils import vae_loss, gumbel_softmax
 import pandas as pd
+from utils.utils import set_seed
+import numpy as np
+
+set_seed()
+
+def linear_annealing(epoch, start_beta, end_beta, total_epochs):
+
+    beta = start_beta + (end_beta - start_beta) * epoch / total_epochs
+
+    return beta
+
+#https://github.com/haofuml/cyclical_annealing/tree/master
+def frange_cycle_linear(n_iter, start=0.0, stop=1.0,  n_cycle=4, ratio=0.5):
+    L = np.ones(n_iter) * stop
+    period = n_iter/n_cycle
+    step = (stop-start)/(period*ratio) # linear schedule
+
+    for c in range(n_cycle):
+        v, i = start, 0
+        while v <= stop and (int(i+c*period) < n_iter):
+            L[int(i+c*period)] = v
+            v += step
+            i += 1
+    return L 
 
 def create_lagged_data(time_series_tensor, num_lags):
     """
@@ -38,6 +62,31 @@ def create_lagged_data(time_series_tensor, num_lags):
     current_data = time_series_tensor[:, num_lags:]  # Shape: [num_entities, time_steps - num_lags]
 
     return lagged_data, current_data
+
+class AutoregressiveAttention(nn.Module):
+    def __init__(self, d_model):
+        super().__init__()
+        self.query_proj = nn.Linear(d_model, d_model)
+        self.key_proj = nn.Linear(d_model, d_model)
+        self.value_proj = nn.Linear(d_model, d_model) 
+        self.scale = torch.sqrt(torch.tensor(d_model)).to(torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+        
+    def forward(self, inputs):
+        # Create query, key, and value matrices
+        query = self.query_proj(inputs)
+        key = self.key_proj(inputs)
+        value = self.value_proj(inputs)
+        
+        # Calculate attention scores with causal masking 
+        attention_scores = torch.matmul(query, key.transpose(1, 2)) / self.scale
+        attention_mask = torch.triu(torch.ones(attention_scores.size()), diagonal=1).bool().to(attention_scores.device)
+        attention_scores = attention_scores.masked_fill(attention_mask, -1e9)
+        
+        # Apply softmax and calculate weighted sum
+        attention_weights = torch.softmax(attention_scores, dim=-1)
+        output = torch.matmul(attention_weights, value)
+        
+        return output 
 
 class Sampling(nn.Module):
     def forward(self, z_mean, z_log_var):
@@ -131,7 +180,7 @@ class GrangerCausality(nn.Module):
         self.decoder_fc = nn.Linear(hidden_dim * num_heads, input_dim)
 
         # Adjacency Matrix for Causal Graph
-        self.adjacency_matrix = nn.Parameter(torch.randn(num_nodes, num_nodes, num_lags))
+        self.adjacency_matrix = nn.Parameter(torch.randn(num_nodes, num_nodes))
 
     def forward(self, entity_indices, relation_indices, timestamp_indices, time_series_data, edge_index, lagged_data):
         """
@@ -194,10 +243,13 @@ class GrangerCausality(nn.Module):
 
         #adj = self.adjacency_matrix.mean(dim=2)
 
-        causal_effect = torch.einsum("ijl,tj->ij",self.adjacency_matrix,x_reconstructed)
+        #causal_effect = torch.einsum("ij,tjk->ij",self.adjacency_matrix,z)
+        causal_effect = torch.einsum("ij,tj->ij",self.adjacency_matrix,x_reconstructed)
 
         # Learned Adjacency Matrix
-        adj = torch.sigmoid(torch.abs(causal_effect))  # Values in [0, 1]
+        #adj = torch.sigmoid(torch.abs(causal_effect))  # Values in [0, 1]
+        #m = nn.Softmax(dim=1)
+        adj = gumbel_softmax(causal_effect)
 
         return z, mean, log_var, x_reconstructed, causal_effect, adj
 
@@ -226,20 +278,25 @@ class GrangerCausality(nn.Module):
         return recon_loss + beta * kl_divergence + sparsity_loss
 
 
-def train_model(data_class,pretrained_tkg):
+def train_model(data_class,pretrained_tkg,epochs=100):
     edge_index = data_class.edge_index
     entity_indices = data_class.entity_indices
     relation_indices = data_class.relation_indices
     timestamp_indices = data_class.timestamp_indices
     time_series_data = data_class.time_series_tensor
     lagged_data, original = create_lagged_data(time_series_data,1)
-
+    # = lagged_data.to(torch.float32)
     model = GrangerCausality(pretrained_tkg ,input_dim=time_series_data.shape[1], hidden_dim=32, latent_dim=4, num_heads=4, num_nodes=time_series_data.shape[1], num_lags=1)
     optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
-    for epoch in range(50):
+    
+    beta_schedule = frange_cycle_linear(epochs)
+    for epoch in range(epochs):
+        sparsity_weight = linear_annealing(epoch, start_beta=0.001, end_beta=.01, total_epochs=epochs)
+        beta = beta_schedule[epoch]
         optimizer.zero_grad()
-        z, mean, log_var, x_reconstructed, causal_effect, adj = model(entity_indices, relation_indices, timestamp_indices, time_series_data, edge_index, lagged_data)
-        loss = model.loss_function(x_reconstructed, time_series_data, mean, log_var, adj)
+        z, mean, log_var, x_reconstructed, causal_effect, adj = model(entity_indices, relation_indices, timestamp_indices, time_series_data, edge_index,lagged_data=lagged_data)
+        
+        loss = model.loss_function(x_reconstructed, time_series_data, mean, log_var, adj,beta=beta,sparsity_weight=sparsity_weight)
         loss.backward()
         optimizer.step()
     
