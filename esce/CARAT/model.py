@@ -28,9 +28,6 @@ class GraphLearningModule(nn.Module):
         # Learnable adjacency matrix
         self.edge_score = nn.Parameter(torch.randn(num_nodes, num_nodes))
 
-        # GAT Layer to learn relationships dynamically
-        self.gat = GATConv(hidden_dim, hidden_dim, heads=attention_heads, concat=False)
-
         # Prior adjacency matrix
         if prior_adj_matrix is not None:
             self.prior_adj = torch.tensor(prior_adj_matrix, dtype=torch.float)
@@ -47,10 +44,7 @@ class GraphLearningModule(nn.Module):
         # Convert to sparse edge list
         edge_index, edge_weights = dense_to_sparse(adj_matrix)
 
-        # Apply Graph Attention
-        x = self.gat(x, edge_index)
-
-        return edge_index, x 
+        return edge_index, edge_weights 
 
 class CausalGraphVAE(nn.Module):
     def __init__(self, input_dim, embed_dim, hidden_dim, latent_dim, num_nodes, prior_adj_matrix=None, attention_heads=4):
