@@ -2,7 +2,7 @@ import torch
 from torch_geometric.utils import dense_to_sparse
 import torch.nn as nn
 import torch.optim as optim
-from torch_geometric.nn import GATv2Conv
+from torch_geometric.nn import GATv2Conv,GATConv
 from torch_geometric.data import Data
 import torch_geometric.transforms as T
 import torch.nn.functional as F
@@ -18,36 +18,39 @@ from tkgngc.model import train_model
 
 class GraphLearningModule(nn.Module):
     """
-    Learns an adjacency matrix and converts it to a dynamic edge list.
+    Learns an adjacency matrix with Graph Attention.
     """
     def __init__(self, num_nodes, hidden_dim, prior_adj_matrix=None, attention_heads=4):
         super(GraphLearningModule, self).__init__()
         self.num_nodes = num_nodes
         self.attention_heads = attention_heads
 
-        # Learnable adjacency matrix (edge probabilities)
+        # Learnable adjacency matrix
         self.edge_score = nn.Parameter(torch.randn(num_nodes, num_nodes))
 
-        # Incorporate prior knowledge
+        # GAT Layer to learn relationships dynamically
+        self.gat = GATConv(hidden_dim, hidden_dim, heads=attention_heads, concat=False)
+
+        # Prior adjacency matrix
         if prior_adj_matrix is not None:
             self.prior_adj = torch.tensor(prior_adj_matrix, dtype=torch.float)
         else:
             self.prior_adj = torch.zeros(num_nodes, num_nodes)
 
-    def forward(self):
+    def forward(self, x):
         """
-        Learn adjacency matrix dynamically and convert to edge list.
+        Compute the learned adjacency matrix with attention.
         """
-        adj_matrix = torch.sigmoid(self.edge_score)
+        adj_matrix = torch.sigmoid(self.edge_score) + self.prior_adj
+        adj_matrix = torch.clamp(adj_matrix, 0, 1)
 
-        # Strengthen known causal relationships
-        adj_matrix = adj_matrix + self.prior_adj  
-        adj_matrix = torch.clamp(adj_matrix, 0, 1)  # Keep values in [0,1]
-
-        # Convert dense adjacency matrix to sparse edge list
+        # Convert to sparse edge list
         edge_index, edge_weights = dense_to_sparse(adj_matrix)
 
-        return edge_index, edge_weights
+        # Apply Graph Attention
+        x = self.gat(x, edge_index)
+
+        return edge_index, x 
 
 class CausalGraphVAE(nn.Module):
     def __init__(self, input_dim, embed_dim, hidden_dim, latent_dim, num_nodes, prior_adj_matrix=None, attention_heads=4):
