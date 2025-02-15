@@ -13,8 +13,8 @@ from utils.utils import set_seed
 set_seed()
 
 # Automatically select GPU if available, otherwise use CPU
-#device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-device = torch.device( "cpu")
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+#device = torch.device( "cpu")
 print(f"Using device: {device}")
 
 class GraphLearningModule(nn.Module):
@@ -133,7 +133,7 @@ class CausalGraphVAE(nn.Module):
 
 
 def causal_vae_loss(recon_x, x, mu, logvar, adj_matrix, prior_adj_matrix, 
-                    lambda_sparsity=1e-3, lambda_acyclic=1e-2, lambda_attention=1e-2):
+                    lambda_sparsity=1e-3, lambda_acyclic=1e-1, lambda_attention=1e-2):
     """
     Computes the loss function for the Causal Graph VAE with attention.
     """
@@ -225,7 +225,7 @@ def train_causal_vae(model, optimizer, dataloader, prior_adj_matrix, num_epochs=
             epochs_no_improve = 0  # Reset counter
         else:
             epochs_no_improve += 1  # Increment counter if no improvement
-        if epoch % 10 == 0:
+        if epoch % 100 == 0:
             print(f"Epoch {epoch}: Average Loss = {avg_loss:.4f}, Best Loss = {best_loss:.4f}")
 
         # Early stopping condition
