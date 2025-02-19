@@ -10,7 +10,7 @@ def get_adjacency(cols,causal_indices,non_causal_indices,num_nodes):
     for i, row in enumerate(A0):
         for j, column in enumerate(row):
             if (j in non_causal_indices) and (i in causal_indices) & (i!=j):
-                A0[i,j] = 0.5
+                A0[i,j] = 0.15
     return A0
 
 class create_granger_gat_data:
@@ -21,7 +21,7 @@ class create_granger_gat_data:
         self.timestamp_indices = data_class.timestamp_indices
         self.time_series_data = data_class.time_series_tensor
         self.pretrained_tkg = pretrained_tkg
-        
+
     def retrain_tkg(self):
         quads = (
             self.entity_indices[:-1],  # Head entities
@@ -89,25 +89,3 @@ class TimeSeriesDataset(Dataset):
         """
         return self.data[idx], self.entity_embeddings[idx], self.time_embeddings[idx]
 
-def create_lagged_features(data, num_lags, pad_value=np.nan):
-    """
-    Creates lagged versions of input data.
-    
-    Args:
-        data (numpy.ndarray or torch.Tensor): Input data of shape (rows, features).
-        num_lags (int): Number of lagged time steps to create.
-        pad_value (float, optional): Value to use for padding. Defaults to NaN.
-        
-    Returns:
-        torch.Tensor: Lagged data of shape (rows, num_lags, features).
-    """
-    if isinstance(data, np.ndarray):
-        data = torch.tensor(data, dtype=torch.float32)  # Convert to PyTorch tensor if needed
-    
-    rows, features = data.shape
-    lagged_data = torch.full((rows, num_lags, features), pad_value, dtype=data.dtype)  # Initialize with pad_value
-    
-    for lag in range(1, num_lags + 1):
-        lagged_data[lag:, lag - 1, :] = data[:-lag]  # Shift data down by `lag` steps
-    
-    return lagged_data

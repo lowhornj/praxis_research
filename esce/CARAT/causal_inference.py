@@ -5,14 +5,17 @@ from dowhy import gcm
 import numpy as np
 import pandas as pd
 
+
 class causal_inference:
-    def __init__(self, adj_matrix, new_data, old_data):
+    def __init__(self, adj_matrix, new_data, old_data,potential_causes):
         super(causal_inference, self).__init__()
         self.adj_matrix=adj_matrix
-        self.adj_matrix[self.adj_matrix < 0.5] = 0
+        self.threshold = np.mean(adj_matrix)
+        self.adj_matrix[self.adj_matrix < self.threshold] = 0
         np.fill_diagonal(self.adj_matrix, 0, wrap=False)
         self.new_data = new_data
         self.old_data = old_data
+        self.potential_causes = potential_causes
         self.cols = list(new_data.columns)
         self.causal_graph = nx.DiGraph(self.adj_matrix)
         self.topological_remove_cycles(self.causal_graph)   
@@ -77,10 +80,24 @@ class causal_inference:
         self.causal_attributions = gcm.distribution_change(self.causal_model, self.old_data, self.new_data, anomaly)
         abs_attributions = {}
         for k, v in self.causal_attributions.items():
-            if k != anomaly:
+            if (k != anomaly) & (k in self.potential_causes):
                 abs_attributions[k] = abs(v)
         
         self.causal_factors = sorted(abs_attributions.items(), key=lambda item: item[1], reverse=True)
+
+        causal_effects = {}
+        for cause in self.potential_causes:
+            try:
+                causal_effects[cause] =  np.abs(gcm.average_causal_effect(self.causal_model,
+                                     anomaly,
+                                     interventions_alternative={cause: lambda x: 1},
+                                     interventions_reference={cause: lambda x: 0},
+                                     num_samples_to_draw=1000))
+            except:
+                None
+
+        self.causal_effects = sorted(causal_effects.items(), key=lambda item: item[1], reverse=True)
+                 
                 
     def draw_causal_dag(self):
         nx.draw(self.causal_graph, with_labels=True, node_size=800, node_color="skyblue", 

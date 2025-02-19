@@ -10,6 +10,7 @@ from torch.distributions.normal import Normal
 from CARAT.utils import TGCN, A3TGCN
 import copy
 from utils.utils import set_seed
+
 set_seed()
 
 # Automatically select GPU if available, otherwise use CPU
@@ -53,6 +54,35 @@ class GraphLearningModule(nn.Module):
         #print(f"GraphLearningModule Output: edge_index max {edge_index.max()}, expected num_nodes {actual_num_nodes}")
     
         return edge_index.to(device).long(), edge_weights.to(device).double()
+
+
+class GraphAttentionLearningModule(nn.Module):
+    def __init__(self, input_dim, hidden_dim, num_nodes, heads=4):
+        super(GraphAttentionLearningModule, self).__init__()
+        self.num_nodes = num_nodes
+        self.input_emb = nn.Parameter(torch.randn(num_nodes, input_dim,device=device))
+        self.conv = GATConv(input_dim, hidden_dim, heads=heads, concat=True, add_self_loops=False).to(device)
+
+    def forward(self):
+        edge_index = torch.cartesian_prod(torch.arange(self.num_nodes), torch.arange(self.num_nodes)).T
+        edge_index = edge_index.to(device)
+        edge_index = edge_index[:, edge_index[0] != edge_index[1]]
+
+        node_embeddings, (attention_edge_index,attention_weights) = self.conv(self.input_emb, edge_index,return_attention_weights=True)
+
+        if attention_weights.dim() == 2:
+            attention_weights = attention_weights.mean(dim=1)
+
+        # Convert edge attention back to dense adjacency matrix
+        adj_matrix = torch.zeros(self.num_nodes, self.num_nodes, device=device)
+        #adj_matrix[edge_index[0], edge_index[1]] = attention_weights
+        adj_matrix = adj_matrix.index_put(
+            (attention_edge_index[0], attention_edge_index[1]),
+            attention_weights,
+            accumulate=True
+        )
+
+        return edge_index, adj_matrix
     
             
 
@@ -62,6 +92,7 @@ class CausalGraphVAE(nn.Module):
 
         # Graph Learning with Attention (Move to device)
         self.graph_learner = GraphLearningModule(num_nodes, hidden_dim, prior_adj_matrix, attention_heads).to(device)
+        #self.graph_learner = GraphAttentionLearningModule(input_dim,hidden_dim,num_nodes,heads=4)
 
         # Embedding layers for additional inputs
         self.entity_embed_layer = nn.Linear(embed_dim, hidden_dim, dtype=torch.float64).to(device)
@@ -69,7 +100,7 @@ class CausalGraphVAE(nn.Module):
 
         # Temporal Graph ConvolutionalNetwork
         self.tgcn1 = A3TGCN(input_dim + 2 * hidden_dim, hidden_dim,periods=3).to(device).double()
-        self.tgcn2 = A3TGCN(hidden_dim, hidden_dim,periods=3).to(device).double()
+        #self.tgcn2 = A3TGCN(hidden_dim, hidden_dim,periods=3).to(device).double()
 
         # Latent Space
         self.mu_layer = nn.Linear(hidden_dim, latent_dim, dtype=torch.float64).to(device)
@@ -168,7 +199,7 @@ def causal_vae_loss(recon_x, x, mu, logvar, adj_matrix, prior_adj_matrix,
     return total_loss
 
 
-def train_causal_vae(model, optimizer, dataloader, prior_adj_matrix, num_epochs=100, patience=10):
+def train_causal_vae(model, optimizer, dataloader, prior_adj_matrix, num_epochs=100, patience=15):
     model.train()
     prior_adj_matrix = prior_adj_matrix.to(device).double()  # Move prior_adj_matrix to device
 
