@@ -39,6 +39,8 @@ class GraphLearningModule(nn.Module):
     def forward(self):
         adj_matrix = torch.sigmoid(self.edge_score) + self.prior_adj
         adj_matrix = torch.clamp(adj_matrix, 0, 1)
+
+        #adj_matrix = adj_matrix.fill_diagonal_(0)
     
         # Convert adjacency matrix to sparse format
         edge_index, edge_weights = dense_to_sparse(adj_matrix)
@@ -50,7 +52,11 @@ class GraphLearningModule(nn.Module):
         valid_mask = (edge_index[0] < actual_num_nodes) & (edge_index[1] < actual_num_nodes)
         edge_index = edge_index[:, valid_mask]
         edge_weights = edge_weights[valid_mask]
-    
+        
+        # Fill the diagnal with zeros so that there is no self-causality ( X cannot cause X)
+        edge_weights = edge_weights.view(actual_num_nodes, actual_num_nodes)
+        edge_weights = edge_weights.fill_diagonal_(0)
+        edge_weights = edge_weights.view(actual_num_nodes* actual_num_nodes)
         #print(f"GraphLearningModule Output: edge_index max {edge_index.max()}, expected num_nodes {actual_num_nodes}")
     
         return edge_index.to(device).long(), edge_weights.to(device).double()
@@ -89,6 +95,10 @@ class GraphAttentionLearningModule(nn.Module):
 class CausalGraphVAE(nn.Module):
     def __init__(self, input_dim, embed_dim, hidden_dim, latent_dim, num_nodes, prior_adj_matrix=None, attention_heads=4):
         super(CausalGraphVAE, self).__init__()
+
+        self.register_buffer('alpha', torch.tensor(0.0, dtype=torch.float64, device=device))
+        self.register_buffer('rho', torch.tensor(1.0, dtype=torch.float64, device=device))
+
 
         # Graph Learning with Attention (Move to device)
         self.graph_learner = GraphLearningModule(num_nodes, hidden_dim, prior_adj_matrix, attention_heads).to(device)
@@ -162,6 +172,53 @@ class CausalGraphVAE(nn.Module):
     
         return recon_x, mu, logvar, edge_weights.view(actual_num_nodes, actual_num_nodes)
 
+def notears_constraint(W):
+    """
+    NOTEARS function h(W) = trace(expm(W*W)) - d
+    """
+    d = W.shape[0]
+    WW = W * W
+    # matrix_exp is available in PyTorch >= 1.9
+    expm_ww = torch.matrix_exp(WW)
+    return torch.trace(expm_ww) - d
+
+
+def augmented_lagrangian_loss(
+    recon_x, x, mu, logvar, W, model, 
+    lambda_sparsity=1e-3, 
+    lambda_attention=1e-2
+):
+    """
+    W is your adjacency matrix. model.alpha and model.rho 
+    are your Lagrange multiplier and penalty parameter.
+    """
+    # 1) Main loss: reconstruction + KL
+    recon_loss = F.mse_loss(recon_x, x, reduction='sum')
+    kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
+    main_loss = recon_loss + kl_loss
+    
+    # 2) Additional penalty terms you want
+    # e.g. L1 (sparsity):
+    sparsity_loss = lambda_sparsity * torch.norm(W, p=1)
+    
+    # e.g. Attention alignment with prior:
+    #   (assuming the user wants a standard MSE penalty vs prior)
+    #   prior_adj = ...
+    #   attention_loss = lambda_attention * F.mse_loss(W, prior_adj)
+    #   ...
+    
+    # 3) Compute the NOTEARS constraint
+    h_val = notears_constraint(W)
+    
+    # 4) The augmented Lagrangian piece: alpha * h_val + 0.5 * rho * (h_val**2)
+    lagrangian_term = model.alpha * h_val + 0.5 * model.rho * (h_val * h_val)
+    
+    # 5) Combine everything
+    total_loss = main_loss + sparsity_loss + lagrangian_term
+    return total_loss, h_val
+
+
+
 
 def causal_vae_loss(recon_x, x, mu, logvar, adj_matrix, prior_adj_matrix, 
                     lambda_sparsity=1e-3, lambda_acyclic=1e-1, lambda_attention=1e-2):
@@ -186,15 +243,13 @@ def causal_vae_loss(recon_x, x, mu, logvar, adj_matrix, prior_adj_matrix,
     sparsity_loss = lambda_sparsity * torch.norm(adj_matrix, p=1)
 
     # Acyclicity Constraint (Ensures DAG structure)
-    eye_matrix = torch.eye(adj_matrix.shape[0], dtype=torch.float64, device=device)  # Fix: Ensure eye_matrix is float64
-    H = torch.matrix_exp(adj_matrix * adj_matrix)  # Exponentiate the adjacency matrix
-    acyclicity_loss = lambda_acyclic * torch.trace(H - eye_matrix)
+    h_val = notears_constraint(adj_matrix)
 
     # Attention-based Causal Alignment Loss
     attention_loss = lambda_attention * F.mse_loss(adj_matrix, prior_adj_matrix)
 
     # Compute total loss
-    total_loss = recon_loss + kl_loss + sparsity_loss + acyclicity_loss + attention_loss
+    total_loss = recon_loss + kl_loss + sparsity_loss + h_val + attention_loss
 
     return total_loss
 
@@ -228,9 +283,20 @@ def train_causal_vae(model, optimizer, dataloader, prior_adj_matrix, num_epochs=
             recon_x, mu, logvar, adj_matrix = model(x_batch, entity_batch, time_batch, num_nodes=x_batch.shape[1])
 
             # Compute loss
-            loss = causal_vae_loss(
+            """loss = causal_vae_loss(
                 recon_x.double(), x_batch[:,0,:], mu.double(), logvar.double(), adj_matrix.double(), prior_adj_matrix.double()
+            )"""
+
+            loss, h_val = augmented_lagrangian_loss(
+                recon_x.double(),
+                x_batch[:,0,:].double(),
+                mu.double(),
+                logvar.double(),
+                adj_matrix.double(),
+                model,
+                lambda_sparsity=1e-3
             )
+
 
             loss.backward(retain_graph=True)
 
@@ -244,7 +310,9 @@ def train_causal_vae(model, optimizer, dataloader, prior_adj_matrix, num_epochs=
 
             total_loss += loss.item()
             batch_losses.append(loss.item())  # Store batch loss
-
+        
+        with torch.no_grad():
+            model.alpha += model.rho * h_val.item()
         avg_loss = total_loss / len(dataloader)  # Calculate average loss per epoch
         loss_history.append(avg_loss)  # Store epoch loss
         batch_loss_history.append(batch_losses)  # Store batch losses
