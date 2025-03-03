@@ -10,7 +10,7 @@ def get_adjacency(cols,causal_indices,non_causal_indices,num_nodes):
     for i, row in enumerate(A0):
         for j, column in enumerate(row):
             if (j in non_causal_indices) and (i in causal_indices) & (i!=j):
-                A0[i,j] = 0.15
+                A0[i,j] = 0.5
     return A0
 
 class create_granger_gat_data:

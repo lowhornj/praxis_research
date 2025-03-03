@@ -20,36 +20,46 @@ print(f"Using device: {device}")
 
 class GraphLearningModule(nn.Module):
     """
-    Learns intra-slice (W) and inter-slice (A) adjacency matrices separately.
+    Learns an adjacency matrix with Graph Attention.
     """
-    def __init__(self, num_nodes, hidden_dim, prior_adj_matrix=None):
+    def __init__(self, num_nodes, hidden_dim, prior_adj_matrix=None, attention_heads=4):
         super(GraphLearningModule, self).__init__()
         self.num_nodes = num_nodes
-        
-        # Learnable adjacency matrices
-        self.W_score = nn.Parameter(torch.randn(num_nodes, num_nodes, dtype=torch.float64, device=device))
-        self.A_score = nn.Parameter(torch.randn(num_nodes, num_nodes, dtype=torch.float64, device=device))
+        self.attention_heads = attention_heads
 
-        # Prior adjacency matrix (if any)
+        # Learnable adjacency matrix (Move to device)
+        self.edge_score = nn.Parameter(torch.randn(num_nodes, num_nodes, dtype=torch.float64, device=device))
+
+        # Prior adjacency matrix (Move to device)
         if prior_adj_matrix is not None:
             self.prior_adj = torch.tensor(prior_adj_matrix, dtype=torch.float64, device=device)
         else:
-            self.prior_adj = None
+            self.prior_adj = torch.zeros(num_nodes, num_nodes, dtype=torch.float64, device=device)
 
     def forward(self):
-        # Sigmoid activation to constrain values between 0 and 1
-        W = torch.sigmoid(self.W_score)
-        A = torch.sigmoid(self.A_score)
+        adj_matrix = torch.sigmoid(self.edge_score) + self.prior_adj
+        adj_matrix = torch.clamp(adj_matrix, 0, 1)
 
-        # Apply NoTears constraint to W (intra-slice)
-        W = torch.clamp(W, 0, 1)
-        A = torch.clamp(A, 0, 1)
-
-        # Ensure no self-cycles
-        W.fill_diagonal_(0)
-
-        return W, A  # Return separate adjacency matrices
-
+        #adj_matrix = adj_matrix.fill_diagonal_(0)
+    
+        # Convert adjacency matrix to sparse format
+        edge_index, edge_weights = dense_to_sparse(adj_matrix)
+    
+        # Get the true number of nodes (max node index + 1)
+        actual_num_nodes = edge_index.max().item() + 1
+    
+        # Ensure all indices are within bounds
+        valid_mask = (edge_index[0] < actual_num_nodes) & (edge_index[1] < actual_num_nodes)
+        edge_index = edge_index[:, valid_mask]
+        edge_weights = edge_weights[valid_mask]
+        
+        # Fill the diagnal with zeros so that there is no self-causality ( X cannot cause X)
+        #edge_weights = edge_weights.view(actual_num_nodes, actual_num_nodes)
+        #edge_weights = edge_weights.fill_diagonal_(0)
+        #edge_weights = edge_weights.view(actual_num_nodes* actual_num_nodes)
+        #print(f"GraphLearningModule Output: edge_index max {edge_index.max()}, expected num_nodes {actual_num_nodes}")
+    
+        return edge_index.to(device).long(), edge_weights.to(device).double()
 
 
 class GraphAttentionLearningModule(nn.Module):
@@ -91,7 +101,7 @@ class CausalGraphVAE(nn.Module):
 
 
         # Graph Learning with Attention (Move to device)
-        self.graph_learner = GraphLearningModule(num_nodes, hidden_dim, prior_adj_matrix).to(device)
+        self.graph_learner = GraphLearningModule(num_nodes, hidden_dim, prior_adj_matrix, attention_heads).to(device)
         #self.graph_learner = GraphAttentionLearningModule(input_dim,hidden_dim,num_nodes,heads=4)
 
         # Embedding layers for additional inputs
@@ -113,29 +123,28 @@ class CausalGraphVAE(nn.Module):
     def encode(self, x, entity_emb, time_emb, edge_index, edge_weights):
         """
         Encoding with concatenation of entity and timestamp embeddings.
-        Uses a single merged edge index and weight.
         """
+        # Move inputs to correct device and convert to float64
         x = x.to(device).double()
         entity_emb = entity_emb.to(device).double()
         time_emb = time_emb.to(device).double()
-        
         edge_index = edge_index.to(device).long()
         edge_weights = edge_weights.to(device).double()
-    
+
         # Transform entity & timestamp embeddings
         entity_emb = F.relu(self.entity_embed_layer(entity_emb))
         time_emb = F.relu(self.timestamp_embed_layer(time_emb))
-    
+
         # Concatenate embeddings with raw features
         x = torch.cat([x, entity_emb, time_emb], dim=-1)
-    
-        # Temporal Graph Convolutional Network Encoding (Pass merged edge_index)
+
+        # Temporal Graph Convolutional Network Encoding (Pass edge_index dynamically)
         x = F.relu(self.tgcn1(x, edge_index, edge_weights))
-    
+       # x = F.relu(self.tgcn2(x, edge_index, edge_weights))
+
         mu = self.mu_layer(x)
         logvar = self.logvar_layer(x)
         return mu, logvar
-
 
     def reparameterize(self, mu, logvar):
         std = torch.exp(0.5 * logvar)
@@ -145,50 +154,33 @@ class CausalGraphVAE(nn.Module):
     def decode(self, z, edge_index, edge_weights, num_nodes):
         """
         Decodes the learned representation back to the original space.
-        Uses a single merged edge index and weight.
         """
-        x = self.decoder_fc(z)  # Linear transformation to latent space
-    
-        # Apply relu activation
+        x = self.decoder_fc(z)
         x = F.relu(self.tgcn_decoder(x, edge_index, edge_weights))
-    
         return x
 
-
-
     def forward(self, x, entity_emb, time_emb, num_nodes):
-        W, A = self.graph_learner()  # Get W (intra-slice) and A (inter-slice)
+        edge_index, edge_weights = self.graph_learner()
         
-        # Convert to sparse format
-        edge_index_W, edge_weights_W = dense_to_sparse(W)
-        edge_index_A, edge_weights_A = dense_to_sparse(A)
-    
         actual_num_nodes = x.shape[2]  # Ensure alignment
-        if edge_index_W.max() >= actual_num_nodes or edge_index_A.max() >= actual_num_nodes:
-            raise ValueError(f"Invalid edge_index detected! Max index: {max(edge_index_W.max(), edge_index_A.max())}, Expected < {actual_num_nodes}")
-    
-        # Merge intra-slice (W) and inter-slice (A) edges
-        edge_index = torch.cat([edge_index_W, edge_index_A], dim=1)
-        edge_weights = torch.cat([edge_weights_W, edge_weights_A])
+        if edge_index.max() >= actual_num_nodes:
+            raise ValueError(f"Invalid edge_index detected in CausalGraphVAE! Max index: {edge_index.max()}, Expected < {actual_num_nodes}")
     
         mu, logvar = self.encode(x, entity_emb, time_emb, edge_index, edge_weights)
         z = self.reparameterize(mu, logvar)
         recon_x = self.decode(z, edge_index, edge_weights, actual_num_nodes)  # Pass correct num_nodes
     
-        return recon_x, mu, logvar, W, A  # Return adjacency matrices for debugging
-    
-
+        return recon_x, mu, logvar, edge_weights.view(actual_num_nodes, actual_num_nodes)
 
 def notears_constraint(W):
     """
-    NoTears function h(W) = trace(expm(W * W)) - d
-    Ensures acyclicity in the contemporaneous (intra-slice) adjacency matrix.
+    NOTEARS function h(W) = trace(expm(W*W)) - d
     """
     d = W.shape[0]
-    WW = W * W  # Element-wise Hadamard product
-    expm_ww = torch.matrix_exp(WW)  # Matrix exponential
-    return torch.trace(expm_ww) - d  # NoTears condition
-
+    WW = W * W
+    # matrix_exp is available in PyTorch >= 1.9
+    expm_ww = torch.matrix_exp(WW)
+    return torch.trace(expm_ww) - d
 
 
 def augmented_lagrangian_loss(
@@ -228,24 +220,38 @@ def augmented_lagrangian_loss(
 
 
 
-def causal_vae_loss(recon_x, x, mu, logvar, W, A, lambda_sparsity=1e-3, lambda_acyclic=1e-1):
+def causal_vae_loss(recon_x, x, mu, logvar, adj_matrix, prior_adj_matrix, 
+                    lambda_sparsity=1e-3, lambda_acyclic=1e-1, lambda_attention=1e-2):
     """
-    Loss function enforcing acyclicity on intra-slice edges (W) but not time-lagged edges (A).
+    Computes the loss function for the Causal Graph VAE with attention.
     """
+    # Move all tensors to the correct device and convert to float64
+    recon_x = recon_x.to(device).double()
+    x = x.to(device).double()
+    mu = mu.to(device).double()
+    logvar = logvar.to(device).double()
+    adj_matrix = adj_matrix.to(device).double()
+    prior_adj_matrix = prior_adj_matrix.to(device).double()
+
+    # Reconstruction loss
     recon_loss = F.mse_loss(recon_x, x, reduction='sum')
+
+    # KL Divergence loss
     kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
 
-    # L1 sparsity regularization
-    sparsity_loss = lambda_sparsity * (torch.norm(W, p=1) + torch.norm(A, p=1))
+    # Graph Sparsity loss (L1 regularization)
+    sparsity_loss = lambda_sparsity * torch.norm(adj_matrix, p=1)
 
-    # Acyclicity constraint ONLY on intra-slice edges
-    h_val = notears_constraint(W)
-    lagrangian_term = model.alpha * h_val + 0.5 * model.rho * (h_val * h_val)
+    # Acyclicity Constraint (Ensures DAG structure)
+    h_val = notears_constraint(adj_matrix)
 
+    # Attention-based Causal Alignment Loss
+    attention_loss = lambda_attention * F.mse_loss(adj_matrix, prior_adj_matrix)
 
-    total_loss = recon_loss + kl_loss + sparsity_loss + lagrangian_term
-    return total_loss, h_val
+    # Compute total loss
+    total_loss = recon_loss + kl_loss + sparsity_loss + h_val + attention_loss
 
+    return total_loss
 
 
 def train_causal_vae(model, optimizer, dataloader, prior_adj_matrix, num_epochs=100, patience=20):
@@ -274,9 +280,7 @@ def train_causal_vae(model, optimizer, dataloader, prior_adj_matrix, num_epochs=
             time_batch = time_batch.to(device).double()
 
             # Forward pass
-            recon_x, mu, logvar, W, A = model(x_batch, entity_batch, time_batch, num_nodes=x_batch.shape[1])
-
-
+            recon_x, mu, logvar, adj_matrix = model(x_batch, entity_batch, time_batch, num_nodes=x_batch.shape[1])
 
             # Compute loss
             """loss = causal_vae_loss(
@@ -288,7 +292,7 @@ def train_causal_vae(model, optimizer, dataloader, prior_adj_matrix, num_epochs=
                 x_batch[:,0,:].double(),
                 mu.double(),
                 logvar.double(),
-                W.double(),
+                adj_matrix.double(),
                 model,
                 lambda_sparsity=1e-3
             )
