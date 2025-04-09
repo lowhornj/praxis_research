@@ -1,0 +1,5 @@
+def hard_concrete(log_alpha, beta=2/3, gamma=-0.1, zeta=1.1):
+    u = torch.rand_like(log_alpha)
+    s = torch.sigmoid((torch.log(u) - torch.log(1 - u) + log_alpha) / beta)
+    stretched_s = s * (zeta - gamma) + gamma
+    return torch.clamp(stretched_s, 0, 1)
